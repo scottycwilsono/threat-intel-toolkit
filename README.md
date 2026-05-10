@@ -44,7 +44,7 @@ API keys are resolved securely — macOS Keychain is preferred, with a `.env` fi
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/threat-intel-toolkit.git
+git clone https://github.com/scottycwilsono/threat-intel-toolkit.git
 cd threat-intel-toolkit
 python -m venv venv
 source venv/bin/activate
