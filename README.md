@@ -1,6 +1,6 @@
 # Threat Intel Toolkit
 
-A command-line tool for querying threat intelligence APIs to support security investigations and incident response.
+A command-line tool and Claude Desktop MCP server for querying threat intelligence APIs to support security investigations and incident response.
 
 Currently supported: **AbuseIPDB** (IP reputation) · **VirusTotal** (multi-engine analysis) · **Shodan** (host enrichment)
 
@@ -86,6 +86,8 @@ SHODAN_API_KEY=your_shodan_key_here
 
 ## Usage
 
+### CLI
+
 ```bash
 python lookup.py --ip <ip_address>
 ```
@@ -95,6 +97,64 @@ python lookup.py --ip <ip_address>
 ```bash
 python lookup.py --ip 185.220.101.45
 ```
+
+### Claude Desktop (MCP)
+
+Once configured (see below), just ask Claude in plain English:
+
+> "Check 185.220.101.45 for threat intel"
+> "Quick abuse check on 1.2.3.4"
+
+Claude will call `check_ip` or `check_ip_quick` automatically and return the results inline.
+
+---
+
+## Claude Desktop Setup
+
+`mcp_server.py` exposes the toolkit as an MCP server so Claude Desktop can call your lookup functions as tools.
+
+**1. Find your venv Python path** (with venv activated):
+
+```bash
+which python3
+```
+
+**2. Edit the Claude Desktop config:**
+
+```bash
+vim ~/Library/Application\ Support/Claude/claude_desktop_config.json
+```
+
+Add the `mcpServers` block alongside any existing keys:
+
+```json
+{
+  "mcpServers": {
+    "threat-intel-toolkit": {
+      "command": "/path/to/your/venv/bin/python3",
+      "args": ["/path/to/threat-intel-toolkit/mcp_server.py"]
+    }
+  }
+}
+```
+
+**3. Validate the JSON:**
+
+```bash
+python3 -m json.tool ~/Library/Application\ Support/Claude/claude_desktop_config.json
+```
+
+**4. Restart Claude Desktop.**
+
+The server will appear as a connector in Claude Desktop. Once connected, just ask Claude in plain English — it will call `check_ip` or `check_ip_quick` automatically.
+
+**Troubleshooting:** If the server doesn't appear, check the logs:
+
+```bash
+ls ~/Library/Logs/Claude/
+```
+
+Common causes: wrong Python path, JSON syntax error in config, missing `mcp` package in venv.
 
 ---
 
@@ -157,6 +217,7 @@ If Shodan has no scan data for an IP:
 - [x] AbuseIPDB IP reputation lookup
 - [x] VirusTotal multi-engine IP analysis
 - [x] Shodan host enrichment
+- [x] Claude Desktop MCP server integration
 - [ ] Batch IP lookup from a file
 - [ ] JSON output flag for SIEM/SOAR integration
 
