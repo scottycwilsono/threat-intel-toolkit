@@ -4,7 +4,7 @@
 #   Python. It's a Unix convention, not Python syntax.
 
 """
-lookup.py — Combined threat intelligence lookup: AbuseIPDB + VirusTotal.
+lookup.py — Combined threat intelligence lookup: AbuseIPDB + VirusTotal + Shodan.
 
 Usage:
     python lookup.py --ip <ip_address>
@@ -13,6 +13,52 @@ Usage:
 API key resolution order (most secure → least secure):
     1. macOS Keychain  (preferred — never touches disk as plaintext)
     2. .env file       (fallback — kept out of git via .gitignore)
+
+WHAT MAKES SHODAN DIFFERENT FROM ABUSEIPDB AND VIRUSTOTAL:
+─────────────────────────────────────────────────────────────────────────────
+AbuseIPDB answers: "Has this IP been reported for malicious behavior?"
+  → Community-sourced abuse reports. Reactive data. Tells you what happened.
+
+VirusTotal answers: "Do security engines think this IP is malicious?"
+  → Engine-consensus scoring. Reputation-based. Tells you what others think.
+
+Shodan answers: "What is this IP actually running RIGHT NOW?"
+  → Active scanner. Shodan continuously crawls the internet, connects to
+    every routable IP on common ports, and records the raw service banners
+    (the text a server sends when you connect). This is empirical, not
+    opinion-based — it's a snapshot of what the host advertised to the world.
+
+Key structural difference: Shodan's response is a FLAT dict, not a nested
+envelope like VirusTotal's data→attributes chain. The ports list, hostnames,
+OS, and service array are all top-level keys. This reflects that Shodan is
+returning raw technical facts about a single host, not a multi-source
+aggregation that needs metadata layers.
+
+WHY OPEN PORTS AND SERVICES MATTER IN D&R:
+─────────────────────────────────────────────────────────────────────────────
+When you're investigating an IP that contacted your network, knowing WHAT
+that IP is running tells you a lot about its likely purpose:
+
+  • Port 3389 (RDP) open to the internet on a cloud IP:
+    Almost certainly a compromised or intentionally exposed machine. RDP
+    exposed to the internet is one of the top initial access vectors for
+    ransomware. Seeing this on an IP that contacted your network is a red flag.
+
+  • Port 8443/8080 with no registered product:
+    Could be C2 malware using a non-standard port to blend in. Legitimate
+    services don't usually run on these ports without a reason.
+
+  • CVE entries in vulns field:
+    Shodan records CVEs when its banner-grabbing identifies a service version
+    with known vulnerabilities. An IP running unpatched software and contacting
+    your network is either a compromised machine (used as a pivot point) or
+    a deliberate attacker who hasn't maintained their infrastructure.
+
+The combination of AbuseIPDB reputation + VirusTotal engine consensus +
+Shodan active scan gives you the full picture:
+  - Did it behave badly? (AbuseIPDB)
+  - Do tools agree it's bad? (VirusTotal)
+  - What is it, technically? (Shodan)
 """
 
 # ── Standard library imports ──────────────────────────────────────────────────
@@ -124,6 +170,29 @@ VT_MALICIOUS_THRESHOLD = 5
 VT_SUSPICIOUS_THRESHOLD = 1
 # Even 1 malicious engine flag is worth surfacing as SUSPICIOUS.
 
+# ── Shodan Constants ───────────────────────────────────────────────────────────
+# Shodan's API design is the simplest of the three: the key goes in the query
+# string (?key=...) rather than a header. This is less ideal from a security
+# standpoint — query strings can appear in server access logs, browser history,
+# and proxy logs. Headers are the preferred pattern for secrets in modern APIs.
+# That said, Shodan's API is read-only and the key is low-privilege, so the
+# practical risk is manageable.
+
+SHODAN_URL = "https://api.shodan.io/shodan/host"
+# Base URL. We append /{ip} to it, plus ?key={api_key} as a query parameter.
+# SECURITY: Always HTTPS. The key is in the query string (Shodan's design),
+# but TLS still encrypts it in transit — it just means the key can appear in
+# server-side logs at Shodan's end and potentially in local proxy logs.
+
+SHODAN_KEYCHAIN_SERVICE = "threat-intel-toolkit"
+# We reuse the same service label as VirusTotal — both keys live under
+# "threat-intel-toolkit" but with different account labels. This groups all
+# toolkit secrets together in Keychain, making them easy to find.
+
+SHODAN_KEYCHAIN_ACCOUNT = "shodan"
+# The -a label used when storing the key:
+#   security add-generic-password -s threat-intel-toolkit -a shodan -w YOUR_KEY
+
 REQUEST_TIMEOUT_SECONDS = 10
 # Maximum seconds to wait for any API to respond.
 # SECURITY: Without this, a network issue or slow API could block your script
@@ -132,7 +201,7 @@ REQUEST_TIMEOUT_SECONDS = 10
 
 # ── Keychain Retrieval (Generic) ───────────────────────────────────────────────
 # We generalized this function to accept any service/account combination.
-# This lets both AbuseIPDB and VirusTotal share the same Keychain logic
+# This lets AbuseIPDB, VirusTotal, and Shodan share the same Keychain logic
 # without duplicating code — the DRY principle (Don't Repeat Yourself).
 
 def get_key_from_keychain(service, account):
@@ -222,6 +291,25 @@ def get_virustotal_key():
         return key
 
     key = os.environ.get("VIRUSTOTAL_API_KEY")
+    if key:
+        return key
+
+    return None
+
+
+def get_shodan_key():
+    """
+    Resolve the Shodan API key using a secure priority order:
+      1. macOS Keychain   (service="threat-intel-toolkit", account="shodan")
+      2. SHODAN_API_KEY environment variable / .env file
+
+    Returns the key string, or None if neither source has it.
+    """
+    key = get_key_from_keychain(SHODAN_KEYCHAIN_SERVICE, SHODAN_KEYCHAIN_ACCOUNT)
+    if key:
+        return key
+
+    key = os.environ.get("SHODAN_API_KEY")
     if key:
         return key
 
@@ -347,21 +435,102 @@ def query_virustotal(ip_address, api_key):
     return response.json()
 
 
+# ── Shodan API Query ───────────────────────────────────────────────────────────
+
+def query_shodan(ip_address, api_key):
+    """
+    Send a GET request to the Shodan host endpoint for the given IP.
+
+    Returns the parsed JSON response as a Python dict, or None if Shodan
+    has no scan data for this IP (HTTP 404).
+
+    Raises requests exceptions on network or other HTTP errors.
+
+    API DESIGN DIFFERENCES FROM ABUSEIPDB AND VIRUSTOTAL:
+    ┌─────────────────┬─────────────────────────────────────────────────────────┐
+    │ Auth method     │ Query parameter: ?key=...  (not a header)               │
+    │ IP location     │ URL path: /shodan/host/{ip}                             │
+    │ Response shape  │ Flat dict — no data→attributes nesting                  │
+    │ No-data case    │ HTTP 404 (not an error — just means no scan data)       │
+    │ Data source     │ Active internet scanner — empirical, not reputation     │
+    └─────────────────┴─────────────────────────────────────────────────────────┘
+
+    The flat response shape is intentional: Shodan returns raw technical facts
+    about one specific host. There's no aggregation layer, so no envelope is
+    needed. You access ports, hostnames, OS, and vulns directly as top-level
+    keys.
+
+    WHY 404 IS NOT AN ERROR HERE:
+    Most APIs return 404 to mean "you requested something that doesn't exist"
+    in an error sense. Shodan uses it to mean "we haven't scanned this IP" or
+    "this IP returned no open ports." This is legitimate data — it means the
+    host is either offline, firewalled, or simply hasn't been crawled yet.
+    We return None so the caller can display "No data available" rather than
+    treating it as a tool failure.
+    """
+    url = f"{SHODAN_URL}/{ip_address}"
+    # Example: https://api.shodan.io/shodan/host/1.2.3.4
+
+    params = {
+        "key": api_key,
+        # Shodan passes the API key as a query parameter, not a header.
+        # SECURITY: requests will append this as ?key=YOUR_KEY_HERE in the URL.
+        # While TLS encrypts this in transit, query parameters can appear in:
+        #   - Shodan's own server access logs
+        #   - Your local proxy or debugging tool logs (e.g., Charles, mitmproxy)
+        #   - Shell history if you ever construct the curl equivalent manually
+        # The header-based pattern used by AbuseIPDB and VirusTotal is safer.
+        # Shodan's design is a legacy choice; we follow their spec, not ours.
+    }
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+
+    # Shodan 404 = no data for this IP. This is not a tool error — handle
+    # it here so the caller gets None instead of an exception to catch.
+    if response.status_code == 404:
+        return None
+
+    response.raise_for_status()
+    # Shodan-specific HTTP codes to know:
+    #   401 → invalid or missing API key
+    #   403 → your plan doesn't include this feature
+    #   429 → rate limit (free tier: 1 request/second)
+    #   500 → Shodan internal error (retry once before giving up)
+
+    return response.json()
+
+
 # ── Verdict Logic ─────────────────────────────────────────────────────────────
 
-def determine_verdict(abuse_score, vt_malicious):
+def determine_verdict(abuse_score, vt_malicious, shodan_vuln_count=0):
     """
-    Compute the overall verdict from both sources.
+    Compute the overall verdict from all available sources.
 
-    MALICIOUS  : AbuseIPDB score >= 50  OR  VirusTotal malicious >= 5 engines
-    SUSPICIOUS : AbuseIPDB score >= 20  OR  VirusTotal malicious >= 1 engine
-    CLEAN      : Both sources return clean signals
+    MALICIOUS  : AbuseIPDB score >= 50  OR  VT malicious >= 5 engines
+                 OR  Shodan has detected vulnerabilities (vuln count > 0)
+    SUSPICIOUS : AbuseIPDB score >= 20  OR  VT malicious >= 1 engine
+    CLEAN      : All sources return clean signals
 
-    Using OR logic means either source can escalate the verdict — but neither
-    source alone can clear an IP. That's the conservative, defense-first posture
-    you want in a fintech SOC: trust is hard to earn, easy to lose.
+    RATIONALE FOR INCLUDING SHODAN VULNS:
+    A host running publicly known, unpatched vulnerabilities contacting your
+    network is a red flag regardless of whether it has abuse reports. In fintech
+    incident response, an unpatched host is either:
+      a) A compromised machine used as an unwitting pivot point, OR
+      b) Attacker infrastructure that the operator hasn't maintained
+
+    Either way, it warrants MALICIOUS-level scrutiny, not just SUSPICIOUS.
+
+    Using OR logic means any source can escalate the verdict — but no single
+    source alone can clear an IP. That's the conservative, defense-first
+    posture you want in a fintech SOC: trust is hard to earn, easy to lose.
     """
-    if abuse_score >= ABUSEIPDB_MALICIOUS_THRESHOLD or vt_malicious >= VT_MALICIOUS_THRESHOLD:
+    if (abuse_score >= ABUSEIPDB_MALICIOUS_THRESHOLD
+            or vt_malicious >= VT_MALICIOUS_THRESHOLD
+            or shodan_vuln_count > 0):
         return "MALICIOUS"
 
     if abuse_score >= ABUSEIPDB_SUSPICIOUS_THRESHOLD or vt_malicious >= VT_SUSPICIOUS_THRESHOLD:
@@ -372,9 +541,14 @@ def determine_verdict(abuse_score, vt_malicious):
 
 # ── Combined Report ───────────────────────────────────────────────────────────
 
-def print_combined_report(ip_address, abuse_data, vt_data):
+def print_combined_report(ip_address, abuse_data, vt_data, shodan_data):
     """
-    Print a formatted combined report from both AbuseIPDB and VirusTotal.
+    Print a formatted combined report from AbuseIPDB, VirusTotal, and Shodan.
+
+    shodan_data is None when Shodan has no record for this IP — we display
+    a "No data available" section rather than skipping Shodan entirely.
+    Showing the absence of data is itself informative: a brand-new IP with
+    no Shodan history might be freshly spun-up attacker infrastructure.
     """
     # ── Pull AbuseIPDB fields ──────────────────────────────────────────────────
     ad = abuse_data["data"]
@@ -386,7 +560,7 @@ def print_combined_report(ip_address, abuse_data, vt_data):
 
     abuse_reports = ad.get("totalReports", 0)
     abuse_country = ad.get("countryCode") or "Unknown"
-    abuse_isp = ad.get("isp") or "Unknown"
+    abuse_isp     = ad.get("isp") or "Unknown"
 
     # ── Pull VirusTotal fields ─────────────────────────────────────────────────
     # VirusTotal v3 nests everything under data → attributes.
@@ -410,8 +584,48 @@ def print_combined_report(ip_address, abuse_data, vt_data):
     # Total engines = all categories summed. This is what "out of N engines" means.
     vt_total = vt_malicious + vt_suspicious + vt_harmless + vt_undetected + vt_timeout
 
+    # ── Pull Shodan fields ─────────────────────────────────────────────────────
+    # Shodan's response is a flat dict — no nesting. We use .get() with safe
+    # defaults throughout because many fields are optional or absent depending
+    # on what the scanner found.
+    shodan_vuln_count = 0
+
+    if shodan_data:
+        # ports is a list of integers: [22, 80, 443]
+        shodan_ports = shodan_data.get("ports", [])
+
+        # hostnames is a list of strings: ["mail.example.com"]
+        shodan_hostnames = shodan_data.get("hostnames", [])
+
+        # os may be null even when other data exists — many hosts don't expose
+        # their OS via banners. We display "Unknown" rather than None.
+        shodan_os = shodan_data.get("os") or "Unknown"
+
+        # last_update is an ISO 8601 datetime string: "2024-01-14T12:34:56.789000"
+        # We slice the first 10 characters to get just the date: "2024-01-14"
+        last_update_raw = shodan_data.get("last_update") or ""
+        shodan_last_seen = last_update_raw[:10] if last_update_raw else "Unknown"
+
+        # vulns is a dict keyed by CVE ID: { "CVE-2023-1234": {...}, ... }
+        # We only need the keys (CVE IDs) for display and counting.
+        vulns_dict        = shodan_data.get("vulns", {})
+        shodan_vuln_count = len(vulns_dict)
+        shodan_cves       = sorted(vulns_dict.keys())
+        # sorted() puts CVEs in alphabetical order (which sorts chronologically
+        # by year since CVE IDs start with the year: CVE-YYYY-NNNNN).
+
+        # Services: extract the `product` field from each entry in the data array.
+        # `data` is a list of per-port objects; each has `port`, `transport`,
+        # and optionally `product` (the identified service name).
+        # We deduplicate with dict.fromkeys() which preserves insertion order
+        # (unlike set()) — important for readable output.
+        raw_services  = [s.get("product") for s in shodan_data.get("data", []) if s.get("product")]
+        shodan_services = list(dict.fromkeys(raw_services))
+        # dict.fromkeys() is a Python idiom for deduplication with order preserved.
+        # A set would be faster but would scramble the order.
+
     # ── Determine verdict ─────────────────────────────────────────────────────
-    verdict = determine_verdict(abuse_score, vt_malicious)
+    verdict = determine_verdict(abuse_score, vt_malicious, shodan_vuln_count)
 
     # ── ANSI color codes ──────────────────────────────────────────────────────
     # \033[91m = bright red, \033[93m = yellow, \033[92m = bright green,
@@ -459,6 +673,52 @@ def print_combined_report(ip_address, abuse_data, vt_data):
     print(f"  Clean:      {vt_harmless}/{vt_total} engines")
 
     print()
+    print(f"  {BOLD}SHODAN{RESET}")
+
+    if not shodan_data:
+        # Shodan returned 404 — no scan data for this IP.
+        # This is worth showing, not hiding: absence of Shodan data on a
+        # suspicious IP could mean it's new infrastructure (freshly deployed).
+        print("  No data available")
+    else:
+        # Ports: join the list of integers into a comma-separated string.
+        # Example: [22, 80, 443] → "22, 80, 443"
+        ports_str = ", ".join(str(p) for p in sorted(shodan_ports)) or "None detected"
+        print(f"  Ports:      {ports_str}")
+
+        # Services: same join pattern.
+        services_str = ", ".join(shodan_services) if shodan_services else "None identified"
+        print(f"  Services:   {services_str}")
+
+        print(f"  OS:         {shodan_os}")
+
+        # Hostnames: print first one on the same line, subsequent ones indented.
+        # This mirrors the example format in the requirements and keeps the
+        # report readable even when there are many hostnames.
+        if shodan_hostnames:
+            first_hostname, *rest_hostnames = shodan_hostnames
+            # Tuple unpacking: first_hostname = shodan_hostnames[0],
+            # rest_hostnames = shodan_hostnames[1:]. Pythonic and readable.
+            print(f"  Hostnames:  {first_hostname}")
+            for h in rest_hostnames:
+                print(f"              {h}")
+        else:
+            print("  Hostnames:  None")
+
+        # Vulnerabilities: list CVEs if any, otherwise show "None detected".
+        if shodan_cves:
+            first_cve, *rest_cves = shodan_cves
+            print(f"  Vulns:      {first_cve},") if rest_cves else print(f"  Vulns:      {first_cve}")
+            for i, cve in enumerate(rest_cves):
+                # Add a comma after each CVE except the last one.
+                suffix = "," if i < len(rest_cves) - 1 else ""
+                print(f"              {cve}{suffix}")
+        else:
+            print("  Vulns:      None detected")
+
+        print(f"  Last Seen:  {shodan_last_seen}")
+
+    print()
     print(f"  OVERALL VERDICT: {verdict_color}{BOLD}{verdict} {verdict_icon}{RESET}")
     print(f"  {SEP}")
     print()
@@ -469,7 +729,7 @@ def print_combined_report(ip_address, abuse_data, vt_data):
 def main():
     # argparse builds us a proper CLI with --help and argument validation.
     parser = argparse.ArgumentParser(
-        description="Look up an IP address in AbuseIPDB and VirusTotal."
+        description="Look up an IP address in AbuseIPDB, VirusTotal, and Shodan."
     )
 
     parser.add_argument(
@@ -486,11 +746,14 @@ def main():
     args = parser.parse_args()
     # args.ip now contains whatever the user passed to --ip.
 
-    # ── Step 1: Get both API keys ─────────────────────────────────────────────
-    # We fetch both keys before making any API calls so we can fail fast with
+    # ── Step 1: Get all API keys ───────────────────────────────────────────────
+    # We fetch all keys before making any API calls so we can fail fast with
     # a clear error rather than failing halfway through the lookup.
-    abuse_key = get_abuseipdb_key()
-    vt_key    = get_virustotal_key()
+    # "Fail fast" is a resilience pattern: detect configuration problems at
+    # startup, not mid-execution.
+    abuse_key  = get_abuseipdb_key()
+    vt_key     = get_virustotal_key()
+    shodan_key = get_shodan_key()
 
     if not abuse_key:
         print("\n[ERROR] No AbuseIPDB API key found.\n")
@@ -510,8 +773,16 @@ def main():
         print("  VIRUSTOTAL_API_KEY=your_key_here\n")
         sys.exit(1)
 
-    # ── Step 2: Query both APIs ───────────────────────────────────────────────
-    print(f"\nQuerying AbuseIPDB and VirusTotal for {args.ip}...")
+    if not shodan_key:
+        print("\n[ERROR] No Shodan API key found.\n")
+        print("To store your key in macOS Keychain (recommended):")
+        print("  security add-generic-password -s threat-intel-toolkit -a shodan -w YOUR_KEY\n")
+        print("Or add to your .env file:")
+        print("  SHODAN_API_KEY=your_key_here\n")
+        sys.exit(1)
+
+    # ── Step 2: Query all three APIs ──────────────────────────────────────────
+    print(f"\nQuerying AbuseIPDB, VirusTotal, and Shodan for {args.ip}...")
 
     # ── AbuseIPDB ─────────────────────────────────────────────────────────────
     try:
@@ -567,8 +838,38 @@ def main():
         print(f"[ERROR] Unexpected VirusTotal error: {e}")
         sys.exit(1)
 
+    # ── Shodan ────────────────────────────────────────────────────────────────
+    # Note: query_shodan() returns None on HTTP 404 (no data for IP).
+    # That's handled inside query_shodan itself. The exceptions we catch here
+    # are genuine failures: network errors, auth errors, rate limits.
+    try:
+        shodan_data = query_shodan(args.ip, shodan_key)
+
+    except requests.exceptions.Timeout:
+        print(f"[ERROR] Shodan request timed out after {REQUEST_TIMEOUT_SECONDS}s.")
+        sys.exit(1)
+
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "unknown"
+        print(f"[ERROR] Shodan returned HTTP {status}.")
+        if status == 401:
+            print("  → Your Shodan API key is invalid or expired.")
+        elif status == 403:
+            print("  → Your Shodan plan does not permit this query.")
+        elif status == 429:
+            print("  → Shodan rate limit exceeded. Free tier: 1 request/second.")
+        sys.exit(1)
+
+    except requests.exceptions.ConnectionError:
+        print("[ERROR] Could not connect to Shodan. Check your network.")
+        sys.exit(1)
+
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Unexpected Shodan error: {e}")
+        sys.exit(1)
+
     # ── Step 3: Display the combined report ───────────────────────────────────
-    print_combined_report(args.ip, abuse_data, vt_data)
+    print_combined_report(args.ip, abuse_data, vt_data, shodan_data)
 
 
 # This block only runs when you execute this file directly:
