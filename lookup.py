@@ -4,11 +4,11 @@
 #   Python. It's a Unix convention, not Python syntax.
 
 """
-lookup.py — AbuseIPDB threat intelligence lookup tool.
+lookup.py — Combined threat intelligence lookup: AbuseIPDB + VirusTotal.
 
 Usage:
-    python lookup.py <ip_address>
-    python lookup.py 1.2.3.4
+    python lookup.py --ip <ip_address>
+    python lookup.py --ip 1.2.3.4
 
 API key resolution order (most secure → least secure):
     1. macOS Keychain  (preferred — never touches disk as plaintext)
@@ -39,8 +39,8 @@ import argparse
 
 import os
 # os gives us access to environment variables (os.environ).
-# We use it to read ABUSEIPDB_API_KEY from the shell environment, which can
-# be populated by python-dotenv reading a .env file.
+# We use it to read API keys from the shell environment, which can be
+# populated by python-dotenv reading a .env file.
 
 # ── Third-party imports ───────────────────────────────────────────────────────
 # These must be installed via: pip install -r requirements.txt
@@ -59,16 +59,16 @@ from dotenv import load_dotenv
 # This is the standard pattern for keeping secrets out of source control.
 
 # ── Load .env file (if present) ───────────────────────────────────────────────
-# This must happen BEFORE we try to read os.environ for the API key.
+# This must happen BEFORE we try to read os.environ for any API key.
 # If no .env file exists, load_dotenv() silently does nothing — no error.
 # SECURITY: load_dotenv() only sets a variable if it isn't already set in the
 # environment. Real environment variables (set in your shell) always win.
 # This prevents a malicious .env file from overwriting shell-level secrets.
 load_dotenv()
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── AbuseIPDB Constants ────────────────────────────────────────────────────────
 # Define fixed values once at the top. If AbuseIPDB changes their URL or you
-# want to adjust the threshold, you change it in one place — not scattered
+# want to adjust a threshold, you change it in one place — not scattered
 # throughout the code.
 
 ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check"
@@ -77,50 +77,81 @@ ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check"
 # plaintext over the network. requests enforces TLS by default when the URL
 # starts with https://.
 
-KEYCHAIN_SERVICE = "abuseipdb"
-# The "service" label we used when storing the key in Keychain.
+ABUSEIPDB_KEYCHAIN_SERVICE = "abuseipdb"
+# The "service" label we used when storing the AbuseIPDB key in Keychain.
 # Think of it as a folder name inside Keychain.
 
-KEYCHAIN_ACCOUNT = "api_key"
+ABUSEIPDB_KEYCHAIN_ACCOUNT = "api_key"
 # The "account" label — the specific item inside that service folder.
 
-MALICIOUS_THRESHOLD = 25
-# AbuseIPDB returns a confidence score from 0–100.
-# 0  = no reports, 100 = confirmed abuser.
-# We treat anything ≥ 25 as MALICIOUS. This is a judgment call you can tune.
-# SECURITY CONTEXT: In a fintech SOC, you might lower this to 10 to be more
-# aggressive about blocking. For an allowlist review, you might raise it to 50.
-# The threshold should match your risk tolerance and false-positive budget.
+ABUSEIPDB_MALICIOUS_THRESHOLD = 50
+# AbuseIPDB score threshold for a MALICIOUS verdict. Score is 0–100.
+# SECURITY CONTEXT: In a fintech SOC you might lower this to catch more
+# threats at the cost of more false positives. Tune to your risk tolerance.
 
-REQUEST_TIMEOUT_SECONDS = 10
-# Maximum seconds to wait for AbuseIPDB to respond.
-# SECURITY: Without this, a network issue or slow API could block your script
-# forever. In incident response, a hung tool can be worse than a failed one.
+ABUSEIPDB_SUSPICIOUS_THRESHOLD = 20
+# AbuseIPDB score threshold for a SUSPICIOUS verdict (below MALICIOUS).
 
 LOOKBACK_DAYS = 90
 # How far back to look for abuse reports. AbuseIPDB max is 365.
 # 90 days is a reasonable balance: recent enough to be relevant,
 # long enough to catch slow-burn C2 infrastructure.
 
+# ── VirusTotal Constants ───────────────────────────────────────────────────────
+# API DESIGN NOTE: VirusTotal v3 puts the resource (the IP) in the URL path:
+#   GET /api/v3/ip_addresses/1.2.3.4
+# AbuseIPDB puts it in query parameters:
+#   GET /api/v2/check?ipAddress=1.2.3.4
+#
+# The path-based style is more "RESTful" — the URL itself identifies the
+# resource you're requesting. Query params are typically for filtering or
+# options, not the primary resource identifier.
 
-# ── API Key Retrieval ─────────────────────────────────────────────────────────
+VIRUSTOTAL_URL = "https://www.virustotal.com/api/v3/ip_addresses"
+# Base URL. We append /{ip_address} to it at query time.
 
-def get_api_key_from_keychain():
+VT_KEYCHAIN_SERVICE = "threat-intel-toolkit"
+# Per the requirements: security add-generic-password -s threat-intel-toolkit
+# -a virustotal -w YOUR_KEY
+
+VT_KEYCHAIN_ACCOUNT = "virustotal"
+
+VT_MALICIOUS_THRESHOLD = 5
+# How many VirusTotal engines must flag an IP as malicious to call it MALICIOUS.
+# VirusTotal queries ~70+ engines. A single engine flagging an IP can be a
+# false positive (some engines are noisy). 5+ is a more reliable signal.
+
+VT_SUSPICIOUS_THRESHOLD = 1
+# Even 1 malicious engine flag is worth surfacing as SUSPICIOUS.
+
+REQUEST_TIMEOUT_SECONDS = 10
+# Maximum seconds to wait for any API to respond.
+# SECURITY: Without this, a network issue or slow API could block your script
+# forever. In incident response, a hung tool can be worse than a failed one.
+
+
+# ── Keychain Retrieval (Generic) ───────────────────────────────────────────────
+# We generalized this function to accept any service/account combination.
+# This lets both AbuseIPDB and VirusTotal share the same Keychain logic
+# without duplicating code — the DRY principle (Don't Repeat Yourself).
+
+def get_key_from_keychain(service, account):
     """
-    Try to retrieve the AbuseIPDB API key from macOS Keychain.
+    Try to retrieve an API key from macOS Keychain.
+
+    Args:
+        service: The -s label used when the key was stored (e.g., "abuseipdb")
+        account: The -a label used when the key was stored (e.g., "api_key")
 
     Returns the key as a string, or None if not found.
-
-    To store your key in Keychain first, run this in your terminal:
-        security add-generic-password -s abuseipdb -a api_key -w YOUR_KEY_HERE
     """
     try:
         result = subprocess.run(
             # We call the macOS `security` CLI tool — it ships with every Mac.
             # -s = service name, -a = account name, -w = output just the password
             ["security", "find-generic-password",
-             "-s", KEYCHAIN_SERVICE,
-             "-a", KEYCHAIN_ACCOUNT,
+             "-s", service,
+             "-a", account,
              "-w"],
 
             capture_output=True,
@@ -154,27 +185,46 @@ def get_api_key_from_keychain():
         return None
 
 
-def get_api_key():
+# ── API Key Resolution ─────────────────────────────────────────────────────────
+# Each function tries Keychain first, then falls back to the .env file.
+# This pattern means we never have to store keys in plaintext if we don't
+# want to — Keychain is always the preferred path.
+
+def get_abuseipdb_key():
     """
-    Resolve the API key using a secure priority order:
-      1. macOS Keychain (most secure — encrypted, never on disk as plaintext)
-      2. Environment variable / .env file (acceptable — kept out of git)
+    Resolve the AbuseIPDB API key using a secure priority order:
+      1. macOS Keychain   (most secure — encrypted, never on disk as plaintext)
+      2. ABUSEIPDB_API_KEY environment variable / .env file
 
     Returns the key string, or None if neither source has it.
     """
-    # Try Keychain first — it's the most secure option.
-    key = get_api_key_from_keychain()
+    key = get_key_from_keychain(ABUSEIPDB_KEYCHAIN_SERVICE, ABUSEIPDB_KEYCHAIN_ACCOUNT)
     if key:
         return key
 
-    # Fall back to environment variable.
-    # load_dotenv() already ran at module load time, so ABUSEIPDB_API_KEY will
-    # be in os.environ if it was in the .env file.
     key = os.environ.get("ABUSEIPDB_API_KEY")
     if key:
         return key
 
-    # Neither source had a key. Return None so main() can print a helpful error.
+    return None
+
+
+def get_virustotal_key():
+    """
+    Resolve the VirusTotal API key using a secure priority order:
+      1. macOS Keychain   (service="threat-intel-toolkit", account="virustotal")
+      2. VIRUSTOTAL_API_KEY environment variable / .env file
+
+    Returns the key string, or None if neither source has it.
+    """
+    key = get_key_from_keychain(VT_KEYCHAIN_SERVICE, VT_KEYCHAIN_ACCOUNT)
+    if key:
+        return key
+
+    key = os.environ.get("VIRUSTOTAL_API_KEY")
+    if key:
+        return key
+
     return None
 
 
@@ -186,6 +236,9 @@ def query_abuseipdb(ip_address, api_key):
 
     Returns the parsed JSON response as a Python dictionary.
     Raises requests exceptions on network or HTTP errors.
+
+    API DESIGN: AbuseIPDB authenticates via a custom "Key" header and
+    passes the IP as a query parameter (?ipAddress=...).
     """
     headers = {
         "Key": api_key,
@@ -236,64 +289,178 @@ def query_abuseipdb(ip_address, api_key):
     # json.loads() manually.
 
 
-# ── Report Formatting ─────────────────────────────────────────────────────────
+# ── VirusTotal API Query ───────────────────────────────────────────────────────
 
-def format_report(data):
+def query_virustotal(ip_address, api_key):
     """
-    Print a clean, human-readable report from the AbuseIPDB API response.
+    Send a GET request to the VirusTotal v3 IP address endpoint.
+
+    Returns the parsed JSON response as a Python dictionary.
+    Raises requests exceptions on network or HTTP errors.
+
+    API DESIGN DIFFERENCES FROM ABUSEIPDB:
+    ┌─────────────────┬──────────────────────────────┬──────────────────────────┐
+    │                 │ AbuseIPDB                    │ VirusTotal               │
+    ├─────────────────┼──────────────────────────────┼──────────────────────────┤
+    │ IP location     │ Query param: ?ipAddress=...  │ URL path: /ip_addresses/ │
+    │ Auth header     │ Key: <token>                 │ x-apikey: <token>        │
+    │ Data location   │ response["data"]             │ response["data"]         │
+    │                 │                              │          ["attributes"]  │
+    │ Score type      │ Single 0–100 score           │ Per-engine verdict counts│
+    │ Data source     │ Community abuse reports      │ ~70+ AV/threat engines   │
+    └─────────────────┴──────────────────────────────┴──────────────────────────┘
+
+    The path-based URL style (/ip_addresses/1.2.3.4) is called "resource
+    identification in the path" — a REST design pattern where the URL itself
+    is the address of the specific thing you're requesting.
     """
-    d = data["data"]
-    # The AbuseIPDB response wraps everything in a "data" key:
-    # { "data": { "ipAddress": "...", "abuseConfidenceScore": 42, ... } }
-    # We pull out the inner dict to keep the rest of the code clean.
+    headers = {
+        "x-apikey": api_key,
+        # VirusTotal v3 uses the "x-apikey" header (lowercase, with a dash).
+        # The "x-" prefix is a convention for custom/non-standard HTTP headers.
+        # SECURITY: Same TLS protection applies — encrypted in transit, but
+        # visible in server logs. Never log this header.
 
-    score = d["abuseConfidenceScore"]
-    # 0–100. This is the key signal. It's a weighted average across all reports,
-    # not just a raw count. An IP with 1,000 reports from one user scores lower
-    # than one with 50 reports from 50 different reporters.
+        "Accept": "application/json",
+    }
 
-    verdict = "MALICIOUS" if score >= MALICIOUS_THRESHOLD else "CLEAN"
-    # Binary verdict based on our threshold constant defined at the top.
-    # SECURITY: In production, you'd want a third state — "SUSPICIOUS" —
-    # for the gray zone (e.g., scores 10–40). Binary verdicts can create
-    # false confidence in edge cases.
+    # VirusTotal puts the IP in the URL path, not in query parameters.
+    # We build the full URL by joining the base URL and the IP with a slash.
+    # Example: https://www.virustotal.com/api/v3/ip_addresses/1.2.3.4
+    url = f"{VIRUSTOTAL_URL}/{ip_address}"
 
-    # ANSI escape codes for terminal color.
-    # \033[91m = bright red, \033[92m = bright green, \033[0m = reset to default.
-    # SECURITY NOTE: These are display-only. Never use color coding as the sole
-    # indicator in a log or SIEM — it won't render there. Always include the
-    # text label ("MALICIOUS" / "CLEAN") too, which we do here.
-    RED   = "\033[91m"
-    GREEN = "\033[92m"
-    RESET = "\033[0m"
-    verdict_color = RED if verdict == "MALICIOUS" else GREEN
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        # No params= argument needed — the IP is already in the URL path above.
+    )
 
-    last_reported = d.get("lastReportedAt") or "Never"
-    # .get() returns None if the key is missing (safer than d["key"] which
-    # raises a KeyError). "or 'Never'" converts None to the string "Never"
-    # for clean display. An IP with no reports has lastReportedAt = null in JSON,
-    # which becomes None in Python.
+    response.raise_for_status()
+    # Same pattern as AbuseIPDB: raises HTTPError on 4xx/5xx responses.
+    # VirusTotal-specific codes to know:
+    #   401 → invalid API key
+    #   400 → malformed IP address
+    #   404 → IP not in VirusTotal's database (rarely seen for public IPs)
+    #   429 → rate limit exceeded (free tier: 4 requests/minute)
 
-    # Print the report. The f-string (f"...") lets us embed variables directly
-    # in strings using {curly_braces}. This is the modern Python 3.6+ approach.
+    return response.json()
+
+
+# ── Verdict Logic ─────────────────────────────────────────────────────────────
+
+def determine_verdict(abuse_score, vt_malicious):
+    """
+    Compute the overall verdict from both sources.
+
+    MALICIOUS  : AbuseIPDB score >= 50  OR  VirusTotal malicious >= 5 engines
+    SUSPICIOUS : AbuseIPDB score >= 20  OR  VirusTotal malicious >= 1 engine
+    CLEAN      : Both sources return clean signals
+
+    Using OR logic means either source can escalate the verdict — but neither
+    source alone can clear an IP. That's the conservative, defense-first posture
+    you want in a fintech SOC: trust is hard to earn, easy to lose.
+    """
+    if abuse_score >= ABUSEIPDB_MALICIOUS_THRESHOLD or vt_malicious >= VT_MALICIOUS_THRESHOLD:
+        return "MALICIOUS"
+
+    if abuse_score >= ABUSEIPDB_SUSPICIOUS_THRESHOLD or vt_malicious >= VT_SUSPICIOUS_THRESHOLD:
+        return "SUSPICIOUS"
+
+    return "CLEAN"
+
+
+# ── Combined Report ───────────────────────────────────────────────────────────
+
+def print_combined_report(ip_address, abuse_data, vt_data):
+    """
+    Print a formatted combined report from both AbuseIPDB and VirusTotal.
+    """
+    # ── Pull AbuseIPDB fields ──────────────────────────────────────────────────
+    ad = abuse_data["data"]
+    # AbuseIPDB wraps all results in a top-level "data" key.
+    # Structure: { "data": { "ipAddress": ..., "abuseConfidenceScore": ..., } }
+
+    abuse_score = ad["abuseConfidenceScore"]
+    # 0–100 weighted confidence score.
+
+    abuse_reports = ad.get("totalReports", 0)
+    abuse_country = ad.get("countryCode") or "Unknown"
+    abuse_isp = ad.get("isp") or "Unknown"
+
+    # ── Pull VirusTotal fields ─────────────────────────────────────────────────
+    # VirusTotal v3 nests everything under data → attributes.
+    # This extra layer exists because the API uses a JSON:API-style envelope
+    # that can carry metadata (type, id, links) alongside the actual content.
+    attrs = vt_data["data"]["attributes"]
+
+    stats = attrs.get("last_analysis_stats", {})
+    # last_analysis_stats is a dict with these keys:
+    #   malicious, suspicious, harmless, undetected, timeout
+    # "harmless" = engines that explicitly said it's clean
+    # "undetected" = engines that had no opinion (not the same as clean)
+    # We only count harmless as "clean" — undetected is neutral, not exculpatory.
+
+    vt_malicious  = stats.get("malicious", 0)
+    vt_suspicious = stats.get("suspicious", 0)
+    vt_harmless   = stats.get("harmless", 0)
+    vt_undetected = stats.get("undetected", 0)
+    vt_timeout    = stats.get("timeout", 0)
+
+    # Total engines = all categories summed. This is what "out of N engines" means.
+    vt_total = vt_malicious + vt_suspicious + vt_harmless + vt_undetected + vt_timeout
+
+    # ── Determine verdict ─────────────────────────────────────────────────────
+    verdict = determine_verdict(abuse_score, vt_malicious)
+
+    # ── ANSI color codes ──────────────────────────────────────────────────────
+    # \033[91m = bright red, \033[93m = yellow, \033[92m = bright green,
+    # \033[1m = bold, \033[0m = reset all formatting.
+    # SECURITY NOTE: These are display-only. SIEM systems and log files won't
+    # render them — always include the text label too, which we do here.
+    RED    = "\033[91m"
+    YELLOW = "\033[93m"
+    GREEN  = "\033[92m"
+    BOLD   = "\033[1m"
+    RESET  = "\033[0m"
+
+    if verdict == "MALICIOUS":
+        verdict_color = RED
+        verdict_icon  = "⚠️"
+    elif verdict == "SUSPICIOUS":
+        verdict_color = YELLOW
+        verdict_icon  = "⚠️"
+    else:
+        verdict_color = GREEN
+        verdict_icon  = "✓"
+
+    # ── Print the report ──────────────────────────────────────────────────────
+    SEP = "═" * 44
+    # ═ is Unicode character U+2550 "BOX DRAWINGS DOUBLE HORIZONTAL".
+    # It's a cosmetic choice for readability. In a production tool that pipes
+    # output to a SIEM or JSON parser, you'd output JSON instead of pretty text.
+
     print()
-    print("=" * 50)
-    print("  IP REPUTATION REPORT")
-    print("=" * 50)
-    print(f"  IP Address    : {d['ipAddress']}")
-    print(f"  Country       : {d.get('countryCode') or 'Unknown'}")
-    print(f"  ISP           : {d.get('isp') or 'Unknown'}")
-    print(f"  Usage Type    : {d.get('usageType') or 'Unknown'}")
-    # Usage type examples: "Data Center/Web Hosting/Transit", "ISP/Mobile Carrier",
-    # "Fixed Line ISP". SECURITY CONTEXT: "Data Center" IPs are higher risk than
-    # residential ISPs in many threat models — attackers rent cloud VMs to mask
-    # their real location.
-    print(f"  Abuse Score   : {score}/100")
-    print(f"  Total Reports : {d.get('totalReports', 0)}")
-    print(f"  Last Reported : {last_reported}")
-    print("-" * 50)
-    print(f"  Verdict       : {verdict_color}{verdict}{RESET}")
-    print("=" * 50)
+    print(f"  IP: {BOLD}{ip_address}{RESET}")
+    print(f"  {SEP}")
+
+    print(f"  {BOLD}ABUSEIPDB{RESET}")
+    print(f"  Score:      {abuse_score}/100")
+    print(f"  Reports:    {abuse_reports:,}")
+    # The :, format spec adds thousands separators (4321 → 4,321).
+    # Small detail, big readability improvement for high-report IPs.
+    print(f"  Country:    {abuse_country}")
+    print(f"  ISP:        {abuse_isp}")
+
+    print()
+    print(f"  {BOLD}VIRUSTOTAL{RESET}")
+    print(f"  Malicious:  {vt_malicious}/{vt_total} engines")
+    print(f"  Suspicious: {vt_suspicious}/{vt_total} engines")
+    print(f"  Clean:      {vt_harmless}/{vt_total} engines")
+
+    print()
+    print(f"  OVERALL VERDICT: {verdict_color}{BOLD}{verdict} {verdict_icon}{RESET}")
+    print(f"  {SEP}")
     print()
 
 
@@ -302,55 +469,67 @@ def format_report(data):
 def main():
     # argparse builds us a proper CLI with --help and argument validation.
     parser = argparse.ArgumentParser(
-        description="Look up an IP address in AbuseIPDB threat intelligence."
+        description="Look up an IP address in AbuseIPDB and VirusTotal."
     )
 
     parser.add_argument(
-        "ip",
-        # Positional argument — no flag needed, user just types: python lookup.py 1.2.3.4
+        "--ip",
+        # Named argument with a -- flag. The user types: python lookup.py --ip 1.2.3.4
+        # This is more explicit and self-documenting than a bare positional
+        # argument, especially as the tool grows more flags over time.
+        required=True,
+        # required=True means argparse will error and print usage if --ip is omitted.
+        # Without this, named arguments are optional by default.
         help="IP address to look up (e.g., 1.2.3.4)",
     )
 
     args = parser.parse_args()
-    # args.ip now contains whatever the user typed after the script name.
-    # argparse will print a usage error and exit automatically if ip is missing.
+    # args.ip now contains whatever the user passed to --ip.
 
-    # ── Step 1: Get the API key ───────────────────────────────────────────────
-    api_key = get_api_key()
+    # ── Step 1: Get both API keys ─────────────────────────────────────────────
+    # We fetch both keys before making any API calls so we can fail fast with
+    # a clear error rather than failing halfway through the lookup.
+    abuse_key = get_abuseipdb_key()
+    vt_key    = get_virustotal_key()
 
-    if not api_key:
-        # Print actionable instructions, then exit with code 1 (failure).
-        # SECURITY: We never print what we *tried* as a key — if something
-        # partial was found, printing it could leak a fragment of a secret.
-        print("\n[ERROR] No API key found.\n")
+    if not abuse_key:
+        print("\n[ERROR] No AbuseIPDB API key found.\n")
         print("To store your key in macOS Keychain (recommended):")
         print("  security add-generic-password -s abuseipdb -a api_key -w YOUR_KEY\n")
-        print("Or create a .env file in this directory:")
-        print("  echo 'ABUSEIPDB_API_KEY=your_key_here' > .env\n")
+        print("Or add to your .env file:")
+        print("  ABUSEIPDB_API_KEY=your_key_here\n")
         sys.exit(1)
-        # sys.exit(1) terminates the program immediately with exit code 1.
-        # Exit code 0 = success, anything else = failure (convention).
+        # SECURITY: We never print what we *tried* as a key — if something
+        # partial was found, printing it could leak a fragment of a secret.
 
-    # ── Step 2: Query AbuseIPDB ───────────────────────────────────────────────
-    print(f"\nLooking up {args.ip}...")
+    if not vt_key:
+        print("\n[ERROR] No VirusTotal API key found.\n")
+        print("To store your key in macOS Keychain (recommended):")
+        print("  security add-generic-password -s threat-intel-toolkit -a virustotal -w YOUR_KEY\n")
+        print("Or add to your .env file:")
+        print("  VIRUSTOTAL_API_KEY=your_key_here\n")
+        sys.exit(1)
 
+    # ── Step 2: Query both APIs ───────────────────────────────────────────────
+    print(f"\nQuerying AbuseIPDB and VirusTotal for {args.ip}...")
+
+    # ── AbuseIPDB ─────────────────────────────────────────────────────────────
     try:
-        data = query_abuseipdb(args.ip, api_key)
+        abuse_data = query_abuseipdb(args.ip, abuse_key)
 
     except requests.exceptions.Timeout:
-        print(f"[ERROR] Request timed out after {REQUEST_TIMEOUT_SECONDS}s.")
+        print(f"[ERROR] AbuseIPDB request timed out after {REQUEST_TIMEOUT_SECONDS}s.")
         sys.exit(1)
 
     except requests.exceptions.HTTPError as e:
-        # e.response.status_code tells us exactly what went wrong.
         status = e.response.status_code if e.response is not None else "unknown"
         print(f"[ERROR] AbuseIPDB returned HTTP {status}.")
         if status == 401:
-            print("  → Your API key is invalid or expired.")
+            print("  → Your AbuseIPDB API key is invalid or expired.")
         elif status == 422:
             print("  → The IP address format is invalid.")
         elif status == 429:
-            print("  → Rate limit exceeded. Free accounts get 1,000 checks/day.")
+            print("  → AbuseIPDB rate limit exceeded. Free accounts get 1,000 checks/day.")
         sys.exit(1)
 
     except requests.exceptions.ConnectionError:
@@ -358,16 +537,42 @@ def main():
         sys.exit(1)
 
     except requests.exceptions.RequestException as e:
-        # Catch-all for any other requests error.
-        print(f"[ERROR] Unexpected network error: {e}")
+        print(f"[ERROR] Unexpected AbuseIPDB error: {e}")
         sys.exit(1)
 
-    # ── Step 3: Display the report ────────────────────────────────────────────
-    format_report(data)
+    # ── VirusTotal ────────────────────────────────────────────────────────────
+    try:
+        vt_data = query_virustotal(args.ip, vt_key)
+
+    except requests.exceptions.Timeout:
+        print(f"[ERROR] VirusTotal request timed out after {REQUEST_TIMEOUT_SECONDS}s.")
+        sys.exit(1)
+
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "unknown"
+        print(f"[ERROR] VirusTotal returned HTTP {status}.")
+        if status == 401:
+            print("  → Your VirusTotal API key is invalid or expired.")
+        elif status == 400:
+            print("  → The IP address format is invalid.")
+        elif status == 429:
+            print("  → VirusTotal rate limit exceeded. Free tier: 4 requests/minute.")
+        sys.exit(1)
+
+    except requests.exceptions.ConnectionError:
+        print("[ERROR] Could not connect to VirusTotal. Check your network.")
+        sys.exit(1)
+
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Unexpected VirusTotal error: {e}")
+        sys.exit(1)
+
+    # ── Step 3: Display the combined report ───────────────────────────────────
+    print_combined_report(args.ip, abuse_data, vt_data)
 
 
 # This block only runs when you execute this file directly:
-#   python lookup.py 1.2.3.4
+#   python lookup.py --ip 1.2.3.4
 #
 # It does NOT run when another Python file imports lookup.py as a module.
 # This is the standard Python pattern for making a file both importable
