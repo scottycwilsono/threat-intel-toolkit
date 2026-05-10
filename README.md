@@ -2,21 +2,25 @@
 
 A command-line tool for querying threat intelligence APIs to support security investigations and incident response.
 
-Currently supported: **AbuseIPDB** (IP reputation lookup)
+Currently supported: **AbuseIPDB** (IP reputation lookup) · **VirusTotal** (multi-engine analysis)
 
 ---
 
 ## What It Does
 
-Looks up an IP address against AbuseIPDB's crowdsourced abuse database and returns a formatted report with:
+Looks up an IP address against two independent threat intel sources and returns a combined verdict:
 
+**AbuseIPDB** — crowdsourced abuse database:
 - Abuse confidence score (0–100)
-- Total number of community reports
-- Country, ISP, and usage type
-- Date last reported
-- A MALICIOUS / CLEAN verdict
+- Total community reports
+- Country and ISP
 
-API keys are resolved securely — macOS Keychain is preferred, with a `.env` file as fallback. The key is never hardcoded or committed to source control.
+**VirusTotal** — ~70+ AV and threat intelligence engines:
+- Malicious / suspicious / clean engine counts
+
+**Combined verdict** — MALICIOUS, SUSPICIOUS, or CLEAN, using OR logic across both sources (either source can escalate the verdict; neither alone can clear an IP).
+
+API keys are resolved securely — macOS Keychain is preferred, with a `.env` file as fallback. Keys are never hardcoded or committed to source control.
 
 ---
 
@@ -25,6 +29,7 @@ API keys are resolved securely — macOS Keychain is preferred, with a `.env` fi
 - Python 3.11+
 - macOS (for Keychain integration) or any OS using the `.env` fallback
 - An [AbuseIPDB](https://www.abuseipdb.com) API key — free tier includes 1,000 checks/day
+- A [VirusTotal](https://www.virustotal.com) API key — free tier includes 4 requests/minute
 
 ---
 
@@ -44,10 +49,14 @@ pip install -r requirements.txt
 
 **Option 1 — macOS Keychain (recommended)**
 
-The key is stored encrypted by the OS and never written to disk as plaintext:
+Keys are stored encrypted by the OS and never written to disk as plaintext:
 
 ```bash
-security add-generic-password -s abuseipdb -a api_key -w YOUR_KEY_HERE
+# AbuseIPDB
+security add-generic-password -s abuseipdb -a api_key -w YOUR_ABUSEIPDB_KEY
+
+# VirusTotal
+security add-generic-password -s threat-intel-toolkit -a virustotal -w YOUR_VT_KEY
 ```
 
 **Option 2 — `.env` file (fallback)**
@@ -55,23 +64,24 @@ security add-generic-password -s abuseipdb -a api_key -w YOUR_KEY_HERE
 Create a `.env` file in the project root. It is excluded from git via `.gitignore`:
 
 ```bash
-echo 'ABUSEIPDB_API_KEY=your_key_here' > .env
+ABUSEIPDB_API_KEY=your_abuseipdb_key_here
+VIRUSTOTAL_API_KEY=your_virustotal_key_here
 ```
 
-> Never commit your API key to source control. The tool will tell you exactly what to do if no key is found.
+> Never commit your API keys to source control. The tool will tell you exactly what to do if a key is missing.
 
 ---
 
 ## Usage
 
 ```bash
-python lookup.py <ip_address>
+python lookup.py --ip <ip_address>
 ```
 
 **Example:**
 
 ```bash
-python lookup.py 185.220.101.45
+python lookup.py --ip 185.220.101.45
 ```
 
 ---
@@ -79,21 +89,24 @@ python lookup.py 185.220.101.45
 ## Example Output
 
 ```
-Looking up 185.220.101.45...
+Querying AbuseIPDB and VirusTotal for 185.220.101.45...
 
-==================================================
-  IP REPUTATION REPORT
-==================================================
-  IP Address    : 185.220.101.45
-  Country       : DE
-  ISP           : Franken-Backbone by Michael Bredel
-  Usage Type    : Data Center/Web Hosting/Transit
-  Abuse Score   : 100/100
-  Total Reports : 4321
-  Last Reported : 2025-05-09T22:14:00+00:00
---------------------------------------------------
-  Verdict       : MALICIOUS
-==================================================
+  IP: 185.220.101.45
+  ════════════════════════════════════════════
+
+  ABUSEIPDB
+  Score:      100/100
+  Reports:    4,321
+  Country:    DE
+  ISP:        Franken-Backbone by Michael Bredel
+
+  VIRUSTOTAL
+  Malicious:  18/94 engines
+  Suspicious: 0/94 engines
+  Clean:      71/94 engines
+
+  OVERALL VERDICT: MALICIOUS ⚠️
+  ════════════════════════════════════════════
 ```
 
 ---
@@ -113,8 +126,8 @@ Looking up 185.220.101.45...
 ## Roadmap
 
 - [x] AbuseIPDB IP reputation lookup
+- [x] VirusTotal multi-engine IP analysis
 - [ ] Batch IP lookup from a file
-- [ ] VirusTotal domain and URL lookup
 - [ ] Shodan host enrichment
 - [ ] JSON output flag for SIEM/SOAR integration
 
